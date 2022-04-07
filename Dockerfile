@@ -1,8 +1,14 @@
-FROM golang:alpine
+FROM golang:rc as builder
 
 COPY . /src
-RUN cd /src/cmd/go && go build -mod=vendor -o /usr/bin/go
+
+WORKDIR /src/cmd/go
+RUN go build -mod=vendor
+
+FROM scratch
+
+COPY --from=builder /src/cmd/go/go /go
 
 EXPOSE 8067
 
-CMD ["/usr/bin/go", "--data=/data"]
+CMD ["/go", "--data=/data"]
