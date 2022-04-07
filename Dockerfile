@@ -5,7 +5,7 @@ COPY . /src
 WORKDIR /src/cmd/go
 RUN go build -mod=vendor
 
-FROM scratch
+FROM alpine
 
 COPY --from=builder /src/cmd/go/go /go
 
