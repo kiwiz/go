@@ -3,7 +3,7 @@ FROM golang:rc as builder
 COPY . /src
 
 WORKDIR /src/cmd/go
-RUN go build -mod=vendor -o /usr/bin/go
+RUN go build -mod=vendor -buildvcs=false -o /usr/bin/go
 
 EXPOSE 8067
 
