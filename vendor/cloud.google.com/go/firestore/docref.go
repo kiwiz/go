@@ -47,14 +47,18 @@ type DocumentRef struct {
 
 	// The ID of the document: the last component of the resource path.
 	ID string
+
+	// The options (only read time currently supported) for reading this document
+	readSettings *readSettings
 }
 
 func newDocRef(parent *CollectionRef, id string) *DocumentRef {
 	return &DocumentRef{
-		Parent:    parent,
-		ID:        id,
-		Path:      parent.Path + "/" + id,
-		shortPath: parent.selfPath + "/" + id,
+		Parent:       parent,
+		ID:           id,
+		Path:         parent.Path + "/" + id,
+		shortPath:    parent.selfPath + "/" + id,
+		readSettings: &readSettings{},
 	}
 }
 
@@ -65,7 +69,9 @@ func (d *DocumentRef) Collection(id string) *CollectionRef {
 
 // Get retrieves the document. If the document does not exist, Get return a NotFound error, which
 // can be checked with
-//    grpc.Code(err) == codes.NotFound
+//
+//	status.Code(err) == codes.NotFound
+//
 // In that case, Get returns a non-nil DocumentSnapshot whose Exists method return false and whose
 // ReadTime is the time of the failed read operation.
 func (d *DocumentRef) Get(ctx context.Context) (_ *DocumentSnapshot, err error) {
@@ -75,7 +81,8 @@ func (d *DocumentRef) Get(ctx context.Context) (_ *DocumentSnapshot, err error) 
 	if d == nil {
 		return nil, errNilDocRef
 	}
-	docsnaps, err := d.Parent.c.getAll(ctx, []*DocumentRef{d}, nil)
+
+	docsnaps, err := d.Parent.c.getAll(ctx, []*DocumentRef{d}, nil, d.readSettings)
 	if err != nil {
 		return nil, err
 	}
@@ -122,9 +129,11 @@ func (d *DocumentRef) Get(ctx context.Context) (_ *DocumentSnapshot, err error) 
 //
 //   - omitempty: Do not encode this field if it is empty. A value is empty
 //     if it is a zero value, or an array, slice or map of length zero.
-//   - serverTimestamp: The field must be of type time.Time. When writing, if
-//     the field has the zero value, the server will populate the stored document with
-//     the time that the request is processed.
+//   - serverTimestamp: The field must be of type time.Time. serverTimestamp
+//     is a sentinel token that tells Firestore to substitute the server time
+//     into that field. When writing, if the field has the zero value, the
+//     server will populate the stored document with the time that the request
+//     is processed. However, if the field value is non-zero it won't be saved.
 func (d *DocumentRef) Create(ctx context.Context, data interface{}) (_ *WriteResult, err error) {
 	ctx = trace.StartSpan(ctx, "cloud.google.com/go/firestore.DocumentRef.Create")
 	defer func() { trace.EndSpan(ctx, err) }()
@@ -314,6 +323,13 @@ func (d *DocumentRef) fpvsToWrites(fpvs []fpv, pc *pb.Precondition) ([]*pb.Write
 				return nil, err
 			}
 			transforms = append(transforms, t)
+		case transform:
+			t, err := fieldTransform(fpv.value.(transform), fpv.fieldPath)
+			if err != nil {
+				return nil, err
+			}
+			transforms = append(transforms, t)
+
 		default:
 			switch fpv.value {
 			case Delete:
@@ -467,6 +483,128 @@ func arrayRemoveTransform(ar arrayRemove, fp FieldPath) (*pb.DocumentTransform_F
 	}, nil
 }
 
+type transform struct {
+	t *pb.DocumentTransform_FieldTransform
+
+	// For v2 of this package, we may want to remove this field and
+	// return an error directly from the FieldTransformX functions.
+	err error
+}
+
+// FieldTransformIncrement returns a special value that can be used with Set, Create, or
+// Update that tells the server to transform the field's current value
+// by the given value.
+//
+// The supported values are:
+//
+//	int, int8, int16, int32, int64
+//	uint8, uint16, uint32
+//	float32, float64
+//
+// If the field does not yet exist, the transformation will set the field to
+// the given value.
+func FieldTransformIncrement(n interface{}) transform {
+	v, err := numericTransformValue(n)
+	return transform{
+		t: &pb.DocumentTransform_FieldTransform{
+			TransformType: &pb.DocumentTransform_FieldTransform_Increment{
+				Increment: v,
+			},
+		},
+		err: err,
+	}
+}
+
+// Increment is an alias for FieldTransformIncrement.
+func Increment(n interface{}) transform {
+	return FieldTransformIncrement(n)
+}
+
+// FieldTransformMaximum returns a special value that can be used with Set, Create, or
+// Update that tells the server to set the field to the maximum of the
+// field's current value and the given value.
+//
+// The supported values are:
+//
+//	int, int8, int16, int32, int64
+//	uint8, uint16, uint32
+//	float32, float64
+//
+// If the field is not an integer or double, or if the field does not yet
+// exist,  the transformation will set the field to the given value. If a
+// maximum operation is applied where the field and the input value are of
+// mixed types (that is - one is an integer and one is a double) the field
+// takes on the type of the larger operand. If the operands are equivalent
+// (e.g. 3 and 3.0), the field does not change. 0, 0.0, and -0.0 are all zero.
+// The maximum of a zero stored value and zero input value is always the
+// stored value. The maximum of any numeric value x and NaN is NaN.
+func FieldTransformMaximum(n interface{}) transform {
+	v, err := numericTransformValue(n)
+	return transform{
+		t: &pb.DocumentTransform_FieldTransform{
+			TransformType: &pb.DocumentTransform_FieldTransform_Maximum{
+				Maximum: v,
+			},
+		},
+		err: err,
+	}
+}
+
+// FieldTransformMinimum returns a special value that can be used with Set, Create, or
+// Update that tells the server to set the field to the minimum of the
+// field's current value and the given value.
+//
+// The supported values are:
+//
+//	int, int8, int16, int32, int64
+//	uint8, uint16, uint32
+//	float32, float64
+//
+// If the field is not an integer or double, or if the field does not yet
+// exist,  the transformation will set the field to the given value. If a
+// minimum operation is applied where the field and the input value are of
+// mixed types (that is - one is an integer and one is a double) the field
+// takes on the type of the smaller operand. If the operands are equivalent
+// (e.g. 3 and 3.0), the field does not change. 0, 0.0, and -0.0 are all zero.
+// The minimum of a zero stored value and zero input value is always the
+// stored value. The minimum of any numeric value x and NaN is NaN.
+func FieldTransformMinimum(n interface{}) transform {
+	v, err := numericTransformValue(n)
+	return transform{
+		t: &pb.DocumentTransform_FieldTransform{
+			TransformType: &pb.DocumentTransform_FieldTransform_Minimum{
+				Minimum: v,
+			},
+		},
+		err: err,
+	}
+}
+
+func numericTransformValue(n interface{}) (*pb.Value, error) {
+	switch n.(type) {
+	case int, int8, int16, int32, int64,
+		uint8, uint16, uint32,
+		float32, float64:
+	default:
+		return nil, fmt.Errorf("unsupported type %T for Increment; supported values include int, int8, int16, int32, int64, uint8, uint16, uint32, float32, float64", n)
+	}
+
+	v, _, err := toProtoValue(reflect.ValueOf(n))
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+func fieldTransform(ar transform, fp FieldPath) (*pb.DocumentTransform_FieldTransform, error) {
+	if ar.err != nil {
+		return nil, ar.err
+	}
+	ft := *ar.t
+	ft.FieldPath = fp.toServiceFieldPath()
+	return &ft, nil
+}
+
 type sentinel int
 
 const (
@@ -546,6 +684,9 @@ func (d *DocumentRef) Update(ctx context.Context, updates []Update, preconds ...
 
 // Collections returns an iterator over the immediate sub-collections of the document.
 func (d *DocumentRef) Collections(ctx context.Context) *CollectionIterator {
+	ctx = trace.StartSpan(ctx, "cloud.google.com/go/firestore.DocumentRef.ListCollectionIds")
+	defer func() { trace.EndSpan(ctx, nil) }()
+
 	client := d.Parent.c
 	it := &CollectionIterator{
 		client: client,
@@ -664,9 +805,10 @@ type DocumentSnapshotIterator struct {
 // the current state of the document. If the document has been deleted, Next
 // returns a DocumentSnapshot whose Exists method returns false.
 //
-// Next never returns iterator.Done unless it is called after Stop.
+// Next is not expected to return iterator.Done unless it is called after Stop.
+// Rarely, networking issues may also cause iterator.Done to be returned.
 func (it *DocumentSnapshotIterator) Next() (*DocumentSnapshot, error) {
-	btree, _, readTime, err := it.ws.nextSnapshot()
+	btree, _, rt, err := it.ws.nextSnapshot()
 	if err != nil {
 		if err == io.EOF {
 			err = iterator.Done
@@ -675,7 +817,7 @@ func (it *DocumentSnapshotIterator) Next() (*DocumentSnapshot, error) {
 		return nil, err
 	}
 	if btree.Len() == 0 { // document deleted
-		return &DocumentSnapshot{Ref: it.docref, ReadTime: readTime}, nil
+		return &DocumentSnapshot{Ref: it.docref, ReadTime: rt}, nil
 	}
 	snap, _ := btree.At(0)
 	return snap.(*DocumentSnapshot), nil
@@ -686,4 +828,13 @@ func (it *DocumentSnapshotIterator) Next() (*DocumentSnapshot, error) {
 // concurrently with Next.
 func (it *DocumentSnapshotIterator) Stop() {
 	it.ws.stop()
+}
+
+// WithReadOptions specifies constraints for accessing documents from the database,
+// e.g. at what time snapshot to read the documents.
+func (d *DocumentRef) WithReadOptions(opts ...ReadOption) *DocumentRef {
+	for _, ro := range opts {
+		ro.apply(d.readSettings)
+	}
+	return d
 }
